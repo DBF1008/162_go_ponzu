@@ -11,9 +11,10 @@ import (
 // sendPreflight is used to respond to a cross-origin "OPTIONS" request
 func sendPreflight(res http.ResponseWriter) {
 	res.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type")
-	res.Header().Set("Access-Control-Allow-Origin", "*")
-	res.WriteHeader(200)
-	return
+	// Access-Control-Allow-Origin is already set by responseWithCORS().
+	// Do NOT overwrite it here — doing so would replace a specific domain
+	// with "*" in restricted CORS mode, causing browser inconsistencies.
+	res.WriteHeader(http.StatusOK)
 }
 
 func responseWithCORS(res http.ResponseWriter, req *http.Request) (http.ResponseWriter, bool) {
@@ -21,26 +22,33 @@ func responseWithCORS(res http.ResponseWriter, req *http.Request) (http.Response
 		// check origin matches config domain
 		domain := db.ConfigCache("domain").(string)
 		origin := req.Header.Get("Origin")
+		if origin == "" {
+			// No Origin header — not a cross-origin request, pass through
+			res.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type")
+			res.Header().Set("Access-Control-Allow-Origin", "*")
+			return res, true
+		}
+
 		u, err := url.Parse(origin)
 		if err != nil {
 			log.Println("Error parsing URL from request Origin header:", origin)
 			return res, false
 		}
 
-		// hack to get dev environments to bypass cors since u.Host (below) will
-		// be empty, based on Go's url.Parse function
-		if domain == "localhost" {
-			domain = ""
-		}
-		origin = u.Host
+		// Use Hostname() to compare without port, so that "localhost:8080"
+		// matches domain "localhost", and "example.com" matches "example.com"
+		// regardless of the port the client connected from.
+		originHostname := u.Hostname()
 
 		// currently, this will check for exact match. will need feedback to
 		// determine if subdomains should be allowed or allow multiple domains
 		// in config
-		if origin == domain {
-			// apply limited CORS headers and return
+		if originHostname == domain {
+			// Reflect the actual Origin header value as ACAO so that the
+			// browser receives a valid, fully-qualified origin (including
+			// scheme and port) instead of a bare hostname.
 			res.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type")
-			res.Header().Set("Access-Control-Allow-Origin", domain)
+			res.Header().Set("Access-Control-Allow-Origin", origin)
 			return res, true
 		}
 

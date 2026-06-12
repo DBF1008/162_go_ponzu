@@ -227,6 +227,14 @@ func ConfigCache(key string) interface{} {
 	return val
 }
 
+// SetTestConfigCache allows tests to set individual config cache values
+// without requiring a BoltDB connection. It is intended for test code only.
+func SetTestConfigCache(key string, value interface{}) {
+	mu.Lock()
+	configCache[key] = value
+	mu.Unlock()
+}
+
 // LoadCacheConfig loads the config into a cache to be accessed by ConfigCache()
 func LoadCacheConfig() error {
 	c, err := ConfigAll()

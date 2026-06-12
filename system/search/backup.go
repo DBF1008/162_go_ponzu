@@ -2,61 +2,37 @@ package search
 
 import (
 	"context"
-	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"time"
-
-	"github.com/ponzu-cms/ponzu/system/cfg"
 
 	"github.com/ponzu-cms/ponzu/system/backup"
+	"github.com/ponzu-cms/ponzu/system/cfg"
 )
 
 // Backup creates an archive of a project's search index and writes it
-// to the response as a download
+// to the response as a download.
 func Backup(ctx context.Context, res http.ResponseWriter) error {
-	ts := time.Now().Unix()
-	filename := fmt.Sprintf("search-%d.bak.tar.gz", ts)
-	tmp := os.TempDir()
-	bk := filepath.Join(tmp, filename)
+	filename := backup.FormatFilename("search", ".bak.tar.gz")
+	bk := filepath.Join(os.TempDir(), filename)
 
-	// create search-{stamp}.bak.tar.gz
 	f, err := os.Create(bk)
 	if err != nil {
 		return err
 	}
 
 	err = backup.ArchiveFS(ctx, cfg.SearchDir(), f)
+	f.Close()
 	if err != nil {
+		os.Remove(bk)
 		return err
 	}
 
-	err = f.Close()
+	dl, err := backup.NewFileDownload(bk, filename, "application/octet-stream")
 	if err != nil {
+		os.Remove(bk)
 		return err
 	}
 
-	// write data to response
-	data, err := os.Open(bk)
-	if err != nil {
-		return err
-	}
-	defer data.Close()
-	defer os.Remove(bk)
-
-	disposition := `attachment; filename=%s`
-	info, err := data.Stat()
-	if err != nil {
-		return err
-	}
-
-	res.Header().Set("Content-Type", "application/octet-stream")
-	res.Header().Set("Content-Disposition", fmt.Sprintf(disposition, ts))
-	res.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))
-
-	_, err = io.Copy(res, data)
-
-	return err
+	return dl.Serve(res)
 }

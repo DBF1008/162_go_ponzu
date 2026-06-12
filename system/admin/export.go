@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ponzu-cms/ponzu/management/format"
+	"github.com/ponzu-cms/ponzu/system/backup"
 	"github.com/ponzu-cms/ponzu/system/db"
 	"github.com/ponzu-cms/ponzu/system/item"
 
@@ -69,6 +70,8 @@ func exportCSV(res http.ResponseWriter, req *http.Request, pt func() interface{}
 		res.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	// Guarantee cleanup even if a later step panics.
+	defer os.Remove(tmpFile.Name())
 
 	err = os.Chmod(tmpFile.Name(), 0666)
 	if err != nil {
@@ -113,30 +116,17 @@ func exportCSV(res http.ResponseWriter, req *http.Request, pt func() interface{}
 
 	csvBuf.Flush()
 
-	// write the buffer to a content-disposition response
-	fi, err := tmpFile.Stat()
+	tmpFile.Close()
+
+	filename := fmt.Sprintf("export-%s-%d.csv", t, time.Now().Unix())
+	dl, err := backup.NewFileDownload(tmpFile.Name(), filename, "text/csv")
 	if err != nil {
-		log.Println("Failed to read tmp file info for CSV export:", err)
+		log.Println("Failed to prepare CSV download:", err)
 		res.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	err = tmpFile.Close()
-	if err != nil {
-		log.Println("Failed to close tmp file for CSV export:", err)
-	}
-
-	ts := time.Now().Unix()
-	disposition := `attachment; filename="export-%s-%d.csv"`
-
-	res.Header().Set("Content-Type", "text/csv")
-	res.Header().Set("Content-Disposition", fmt.Sprintf(disposition, t, ts))
-	res.Header().Set("Content-Length", fmt.Sprintf("%d", int(fi.Size())))
-
-	http.ServeFile(res, req, tmpFile.Name())
-
-	err = os.Remove(tmpFile.Name())
-	if err != nil {
-		log.Println("Failed to remove tmp file for CSV export:", err)
+	if err := dl.Serve(res); err != nil {
+		log.Println("Failed to serve CSV download:", err)
 	}
 }

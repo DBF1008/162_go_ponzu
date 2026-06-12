@@ -4,14 +4,14 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 )
 
 // ArchiveFS walks the filesystem starting from basedir writing files encountered
-// tarred and gzipped to the provided writer
+// tarred and gzipped to the provided writer. Cancellation is checked at each
+// file entry; if ctx is cancelled the walk stops and ctx.Err() is returned.
 func ArchiveFS(ctx context.Context, basedir string, w io.Writer) error {
 	gz := gzip.NewWriter(w)
 	tarball := tar.NewWriter(gz)
@@ -35,8 +35,14 @@ func ArchiveFS(ctx context.Context, basedir string, w io.Writer) error {
 		basedir = bdir
 	}
 
-	errChan := make(chan error, 1)
 	walkFn := func(path string, info os.FileInfo, err error) error {
+		// Check cancellation at each step synchronously — no goroutine needed.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		if err != nil {
 			return err
 		}
@@ -79,33 +85,18 @@ func ArchiveFS(ctx context.Context, basedir string, w io.Writer) error {
 		return nil
 	}
 
-	// stop processing if we get a cancellation signal
-	err = filepath.Walk(basedir, func(path string, info os.FileInfo, err error) error {
-		go func() { errChan <- walkFn(path, info, err) }()
-
-		select {
-		case <-ctx.Done():
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-		case err := <-errChan:
-			if err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
-	if err != nil {
-		fmt.Println(err)
-		return err
-	}
-
-	err = gz.Close()
+	err = filepath.Walk(basedir, walkFn)
 	if err != nil {
 		return err
 	}
+
+	// Correct close order: tar first (flushes end-of-archive blocks into
+	// the gzip writer), then gzip (writes the gzip trailer).
 	err = tarball.Close()
+	if err != nil {
+		return err
+	}
+	err = gz.Close()
 	if err != nil {
 		return err
 	}

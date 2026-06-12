@@ -14,6 +14,7 @@ import (
 	"github.com/ponzu-cms/ponzu/system/cfg"
 
 	"github.com/ponzu-cms/ponzu/system/item"
+	"github.com/ponzu-cms/ponzu/system/search/merge"
 
 	"github.com/blevesearch/bleve"
 	"github.com/blevesearch/bleve/mapping"
@@ -157,4 +158,63 @@ func TypeQuery(typeName, query string, count, offset int) ([]string, error) {
 	}
 
 	return results, nil
+}
+
+// TypesQuery conducts a search across the indexes of all provided types and
+// returns a single relevance-ordered set of Ponzu "targets", Type:ID pairs. Hits
+// from every type are merged and ranked together by score, then windowed by count
+// and offset exactly as TypeQuery does for a single type. Types that have no
+// search index are skipped; if none of the provided types has an index, ErrNoIndex
+// is returned.
+func TypesQuery(typeNames []string, query string, count, offset int) ([]string, error) {
+	if offset < 0 {
+		offset = 0
+	}
+
+	var (
+		groups   [][]merge.Hit
+		anyIndex bool
+	)
+	for _, typeName := range typeNames {
+		idx, ok := Search[typeName]
+		if !ok {
+			continue
+		}
+		anyIndex = true
+
+		// Over-fetch enough from each index to cover the merged window: a target
+		// in the global top (offset+count) must rank within the top (offset+count)
+		// of its own index. A negative count means "all", so request as many
+		// documents as the index holds.
+		size := offset + count
+		if count < 0 {
+			docs, err := idx.DocCount()
+			if err != nil {
+				return nil, err
+			}
+			size = offset + int(docs)
+		}
+		if size <= 0 {
+			continue
+		}
+
+		q := bleve.NewQueryStringQuery(query)
+		req := bleve.NewSearchRequestOptions(q, size, 0, false)
+		res, err := idx.Search(req)
+		if err != nil {
+			return nil, err
+		}
+
+		hits := make([]merge.Hit, 0, len(res.Hits))
+		for _, hit := range res.Hits {
+			hits = append(hits, merge.Hit{ID: hit.ID, Score: hit.Score})
+		}
+		groups = append(groups, hits)
+	}
+
+	if !anyIndex {
+		return nil, ErrNoIndex
+	}
+
+	return merge.Scored(groups, count, offset), nil
 }

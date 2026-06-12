@@ -43,3 +43,30 @@ func omitFields(res http.ResponseWriter, req *http.Request, om item.Omittable, d
 
 	return data, nil
 }
+
+// omitItem removes a single content type's Omittable fields from a bare JSON
+// object (one item, not wrapped in a "data" array). It is used for mixed-type
+// result sets — such as a cross-type search response — where each item may be a
+// different type and therefore omit a different set of fields. The array-based
+// omit above remains for single-type responses.
+func omitItem(res http.ResponseWriter, req *http.Request, it interface{}, data []byte) ([]byte, error) {
+	om, ok := it.(item.Omittable)
+	if !ok {
+		return data, nil
+	}
+
+	fields, err := om.Omit(res, req)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, field := range fields {
+		data, err = sjson.DeleteBytes(data, field)
+		if err != nil {
+			log.Println("Error omitting field:", field, "from item.Omittable:", om)
+			return nil, err
+		}
+	}
+
+	return data, nil
+}

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/ponzu-cms/ponzu/system/admin/upload/cloud"
 	"github.com/ponzu-cms/ponzu/system/db"
 	"github.com/ponzu-cms/ponzu/system/item"
 )
@@ -22,6 +23,12 @@ func deleteUploadFromDisk(target string) error {
 	upload := item.FileUpload{}
 	if err = json.Unmarshal(data, &upload); err != nil {
 		return err
+	}
+
+	// Files stored in S3-compatible object storage have an absolute URL path;
+	// remove them from the configured backend instead of the local disk.
+	if cloud.IsRemote(upload.Path) {
+		return cloud.Provider().Delete(upload.Path)
 	}
 
 	// split and rebuild path in OS friendly way

@@ -4,23 +4,26 @@ package upload
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
+	"path"
 	"strconv"
 	"time"
 
-	"github.com/ponzu-cms/ponzu/system/cfg"
-
+	"github.com/ponzu-cms/ponzu/system/admin/upload/cloud"
 	"github.com/ponzu-cms/ponzu/system/db"
 	"github.com/ponzu-cms/ponzu/system/item"
 )
 
 // StoreFiles stores file uploads at paths like /YYYY/MM/filename.ext
+//
+// Files are written through the configured storage backend (cloud.Provider):
+// the local filesystem by default, or an S3-compatible object storage service
+// when credentials are configured. Both the public API and the admin upload
+// entry points funnel through this function, so both honor the selected
+// backend and receive a stable, accessible URL.
 func StoreFiles(req *http.Request) (map[string]string, error) {
 	err := req.ParseMultipartForm(1024 * 1024 * 4) // maxMemory 4MB
 	if err != nil {
@@ -42,7 +45,7 @@ func StoreFiles(req *http.Request) (map[string]string, error) {
 
 	req.Form.Set("timestamp", ts)
 
-	// get or create upload directory to save files from request
+	// parse the timestamp to derive the YYYY/MM storage key prefix
 	i, err := strconv.ParseInt(ts, 10, 64)
 	if err != nil {
 		return nil, err
@@ -50,15 +53,11 @@ func StoreFiles(req *http.Request) (map[string]string, error) {
 
 	tm := time.Unix(int64(i/1000), int64(i%1000))
 
-	urlPathPrefix := "api"
-	uploadDirName := "uploads"
-	uploadDir := filepath.Join(cfg.UploadDir(), fmt.Sprintf("%d", tm.Year()), fmt.Sprintf("%02d", tm.Month()))
-	err = os.MkdirAll(uploadDir, os.ModeDir|os.ModePerm)
-	if err != nil {
-		return nil, err
-	}
+	// select the storage backend: S3-compatible object storage when configured,
+	// otherwise the local filesystem.
+	store := cloud.Provider()
 
-	// loop over all files and save them to disk
+	// loop over all files and save them through the storage backend
 	for name, fds := range req.MultipartForm.File {
 		filename, err := item.NormalizeString(fds[0].Filename)
 		if err != nil {
@@ -67,40 +66,24 @@ func StoreFiles(req *http.Request) (map[string]string, error) {
 
 		src, err := fds[0].Open()
 		if err != nil {
-			err := fmt.Errorf("Couldn't open uploaded file: %s", err)
-			return nil, err
-
-		}
-		defer src.Close()
-
-		// check if file at path exists, if so, add timestamp to file
-		absPath := filepath.Join(uploadDir, filename)
-
-		if _, err := os.Stat(absPath); !os.IsNotExist(err) {
-			filename = fmt.Sprintf("%d-%s", time.Now().Unix(), filename)
-			absPath = filepath.Join(uploadDir, filename)
+			return nil, fmt.Errorf("Couldn't open uploaded file: %s", err)
 		}
 
-		// save to disk (TODO: or check if S3 credentials exist, & save to cloud)
-		dst, err := os.Create(absPath)
+		// storage key relative to the uploads root: YYYY/MM/filename
+		key := fmt.Sprintf("%d/%02d/%s", tm.Year(), tm.Month(), filename)
+
+		res, err := store.Save(key, src, fds[0].Size, fds[0].Header.Get("Content-Type"))
+		src.Close()
 		if err != nil {
-			err := fmt.Errorf("Failed to create destination file for upload: %s", err)
-			return nil, err
-		}
-
-		// copy file from src to dst on disk
-		var size int64
-		if size, err = io.Copy(dst, src); err != nil {
-			err := fmt.Errorf("Failed to copy uploaded file to destination: %s", err)
 			return nil, err
 		}
 
 		// add name:urlPath to req.PostForm to be inserted into db
-		urlPath := fmt.Sprintf("/%s/%s/%d/%02d/%s", urlPathPrefix, uploadDirName, tm.Year(), tm.Month(), filename)
-		urlPaths[name] = urlPath
+		urlPaths[name] = res.URL
 
-		// add upload information to db
-		go storeFileInfo(size, filename, urlPath, fds)
+		// add upload information to db (use the stored object's final name, which
+		// may differ from the original on a local-disk name collision)
+		go storeFileInfo(res.Size, path.Base(res.Key), res.URL, fds)
 	}
 
 	return urlPaths, nil

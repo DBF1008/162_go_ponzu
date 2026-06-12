@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -1832,77 +1833,12 @@ func editHandler(res http.ResponseWriter, req *http.Request) {
 
 		// create a timestamp if one was not set
 		if ts == "" {
-			ts = fmt.Sprintf("%d", int64(time.Nanosecond)*time.Now().UTC().UnixNano()/int64(time.Millisecond))
+			ts = upload.NowMillis()
 			req.PostForm.Set("timestamp", ts)
 		}
 
 		if up == "" {
 			req.PostForm.Set("updated", ts)
-		}
-
-		urlPaths, err := upload.StoreFiles(req)
-		if err != nil {
-			log.Println(err)
-			res.WriteHeader(http.StatusInternalServerError)
-			errView, err := Error500()
-			if err != nil {
-				return
-			}
-
-			res.Write(errView)
-			return
-		}
-
-		for name, urlPath := range urlPaths {
-			req.PostForm.Set(name, urlPath)
-		}
-
-		// check for any multi-value fields (ex. checkbox fields)
-		// and correctly format for db storage. Essentially, we need
-		// fieldX.0: value1, fieldX.1: value2 => fieldX: []string{value1, value2}
-		fieldOrderValue := make(map[string]map[string][]string)
-		for k, v := range req.PostForm {
-			if strings.Contains(k, ".") {
-				fo := strings.Split(k, ".")
-
-				// put the order and the field value into map
-				field := string(fo[0])
-				order := string(fo[1])
-				if len(fieldOrderValue[field]) == 0 {
-					fieldOrderValue[field] = make(map[string][]string)
-				}
-
-				// orderValue is 0:[?type=Thing&id=1]
-				orderValue := fieldOrderValue[field]
-				orderValue[order] = v
-				fieldOrderValue[field] = orderValue
-
-				// discard the post form value with name.N
-				req.PostForm.Del(k)
-			}
-
-		}
-
-		// add/set the key & value to the post form in order
-		for f, ov := range fieldOrderValue {
-			for i := 0; i < len(ov); i++ {
-				position := fmt.Sprintf("%d", i)
-				fieldValue := ov[position]
-
-				if req.PostForm.Get(f) == "" {
-					for i, fv := range fieldValue {
-						if i == 0 {
-							req.PostForm.Set(f, fv)
-						} else {
-							req.PostForm.Add(f, fv)
-						}
-					}
-				} else {
-					for _, fv := range fieldValue {
-						req.PostForm.Add(f, fv)
-					}
-				}
-			}
 		}
 
 		pt := t
@@ -1937,15 +1873,26 @@ func editHandler(res http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		// Let's be nice and make a proper item for the Hookable methods
-		dec := schema.NewDecoder()
-		dec.IgnoreUnknownKeys(true)
-		dec.SetAliasTag("json")
-		err = dec.Decode(post, req.PostForm)
+		// store uploads, collapse multi-value fields, and decode into post so
+		// the Hookable methods observe the values that will be saved
+		err = upload.PrepareForm(req, post)
 		if err != nil {
-			log.Println("Error decoding post form for edit handler:", t, err)
-			res.WriteHeader(http.StatusBadRequest)
-			errView, err := Error400()
+			var decErr *upload.DecodeError
+			if errors.As(err, &decErr) {
+				log.Println("Error decoding post form for edit handler:", t, err)
+				res.WriteHeader(http.StatusBadRequest)
+				errView, err := Error400()
+				if err != nil {
+					return
+				}
+
+				res.Write(errView)
+				return
+			}
+
+			log.Println("Error preparing form for edit handler:", t, err)
+			res.WriteHeader(http.StatusInternalServerError)
+			errView, err := Error500()
 			if err != nil {
 				return
 			}

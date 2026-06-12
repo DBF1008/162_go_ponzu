@@ -18,7 +18,64 @@ import (
 
 	"github.com/ponzu-cms/ponzu/system/db"
 	"github.com/ponzu-cms/ponzu/system/item"
+
+	"github.com/gorilla/schema"
 )
+
+// NowMillis returns the current time as a millisecond Unix timestamp string in
+// UTC, the timestamp format Ponzu stores for content's timestamp/updated fields.
+func NowMillis() string {
+	return fmt.Sprintf("%d", time.Now().UTC().UnixNano()/int64(time.Millisecond))
+}
+
+// DecodeError wraps a failure to decode the form into a content item. Callers
+// use it (via errors.As) to distinguish a malformed client submission (HTTP
+// 400) from a server-side file-storage failure returned by PrepareForm.
+type DecodeError struct {
+	Err error
+}
+
+func (e *DecodeError) Error() string { return e.Err.Error() }
+
+func (e *DecodeError) Unwrap() error { return e.Err }
+
+// PrepareForm runs the steps every content save path shares before the data is
+// handed to the storage layer: it stores any uploaded files and writes their
+// URL paths back into the form, collapses multi-value fields, and decodes the
+// resulting form into post so its Hookable methods observe the values that will
+// be saved. It is the common pre-save step for the content API create/update
+// handlers and the admin edit handler, keeping them consistent on upload fields
+// and multi-value fields. The caller is responsible for setting any timestamps
+// on req.PostForm beforehand (StoreFiles uses them to date the upload path).
+//
+// A failure to store files is returned as-is (a server error); a failure to
+// decode the form is returned wrapped in *DecodeError (a client error).
+func PrepareForm(req *http.Request, post interface{}) error {
+	// StoreFiles parses the multipart form and persists any uploaded files
+	urlPaths, err := StoreFiles(req)
+	if err != nil {
+		return err
+	}
+
+	for name, urlPath := range urlPaths {
+		req.PostForm.Set(name, urlPath)
+	}
+
+	// collapse multi-value fields (ex. checkbox/repeater) into slice values
+	item.FormatMultiValueFields(req.PostForm)
+
+	// decode the form into post so its Hookable methods see proper values
+	dec := schema.NewDecoder()
+	dec.IgnoreUnknownKeys(true)
+	dec.SetAliasTag("json")
+
+	err = dec.Decode(post, req.PostForm)
+	if err != nil {
+		return &DecodeError{Err: err}
+	}
+
+	return nil
+}
 
 // StoreFiles stores file uploads at paths like /YYYY/MM/filename.ext
 func StoreFiles(req *http.Request) (map[string]string, error) {
@@ -30,7 +87,7 @@ func StoreFiles(req *http.Request) (map[string]string, error) {
 	ts := req.FormValue("timestamp") // timestamp in milliseconds since unix epoch
 
 	if ts == "" {
-		ts = fmt.Sprintf("%d", int64(time.Nanosecond)*time.Now().UnixNano()/int64(time.Millisecond)) // Unix() returns seconds since unix epoch
+		ts = NowMillis()
 	}
 
 	// To use for FormValue name:urlPath

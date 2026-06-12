@@ -3,17 +3,15 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/ponzu-cms/ponzu/system/admin/upload"
 	"github.com/ponzu-cms/ponzu/system/db"
 	"github.com/ponzu-cms/ponzu/system/item"
-
-	"github.com/gorilla/schema"
 )
 
 // Updateable accepts or rejects update POST requests to endpoints such as:
@@ -79,68 +77,9 @@ func updateContentHandler(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	ts := fmt.Sprintf("%d", int64(time.Nanosecond)*time.Now().UnixNano()/int64(time.Millisecond))
-	req.PostForm.Set("timestamp", ts)
-	req.PostForm.Set("updated", ts)
-
-	urlPaths, err := upload.StoreFiles(req)
-	if err != nil {
-		log.Println(err)
-		res.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	for name, urlPath := range urlPaths {
-		req.PostForm.Set(name, urlPath)
-	}
-
-	// check for any multi-value fields (ex. checkbox fields)
-	// and correctly format for db storage. Essentially, we need
-	// fieldX.0: value1, fieldX.1: value2 => fieldX: []string{value1, value2}
-	fieldOrderValue := make(map[string]map[string][]string)
-	for k, v := range req.PostForm {
-		if strings.Contains(k, ".") {
-			fo := strings.Split(k, ".")
-
-			// put the order and the field value into map
-			field := string(fo[0])
-			order := string(fo[1])
-			if len(fieldOrderValue[field]) == 0 {
-				fieldOrderValue[field] = make(map[string][]string)
-			}
-
-			// orderValue is 0:[?type=Thing&id=1]
-			orderValue := fieldOrderValue[field]
-			orderValue[order] = v
-			fieldOrderValue[field] = orderValue
-
-			// discard the post form value with name.N
-			req.PostForm.Del(k)
-		}
-
-	}
-
-	// add/set the key & value to the post form in order
-	for f, ov := range fieldOrderValue {
-		for i := 0; i < len(ov); i++ {
-			position := fmt.Sprintf("%d", i)
-			fieldValue := ov[position]
-
-			if req.PostForm.Get(f) == "" {
-				for i, fv := range fieldValue {
-					if i == 0 {
-						req.PostForm.Set(f, fv)
-					} else {
-						req.PostForm.Add(f, fv)
-					}
-				}
-			} else {
-				for _, fv := range fieldValue {
-					req.PostForm.Add(f, fv)
-				}
-			}
-		}
-	}
+	// an update refreshes "updated"; "timestamp" is intentionally left untouched
+	// so the db merge preserves the content's original creation time
+	req.PostForm.Set("updated", upload.NowMillis())
 
 	hook, ok := post.(item.Hookable)
 	if !ok {
@@ -149,13 +88,17 @@ func updateContentHandler(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Let's be nice and make a proper item for the Hookable methods
-	dec := schema.NewDecoder()
-	dec.IgnoreUnknownKeys(true)
-	dec.SetAliasTag("json")
-	err = dec.Decode(post, req.PostForm)
+	// store uploads, collapse multi-value fields, and decode into post so the
+	// Hookable methods observe the values that will be saved
+	err = upload.PrepareForm(req, post)
 	if err != nil {
-		log.Println("Error decoding post form for edit handler:", t, err)
+		var decErr *upload.DecodeError
+		if errors.As(err, &decErr) {
+			log.Println("[Update] error decoding post form:", t, err)
+			res.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		log.Println("[Update] error preparing form:", t, err)
 		res.WriteHeader(http.StatusInternalServerError)
 		return
 	}

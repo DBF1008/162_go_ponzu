@@ -4,17 +4,33 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 )
 
 // ArchiveFS walks the filesystem starting from basedir writing files encountered
-// tarred and gzipped to the provided writer
-func ArchiveFS(ctx context.Context, basedir string, w io.Writer) error {
+// tarred and gzipped to the provided writer. The tar writer is always closed
+// before the gzip writer so the archive is finalized correctly. Walking stops if
+// ctx is cancelled.
+func ArchiveFS(ctx context.Context, basedir string, w io.Writer) (err error) {
 	gz := gzip.NewWriter(w)
 	tarball := tar.NewWriter(gz)
+
+	// Finalize in the right order: the tar writer wraps the gzip writer, so the
+	// tar footer must be flushed into gz (tarball.Close) before the gzip footer
+	// is written (gz.Close). Deferred calls run LIFO, so gz is registered first
+	// and closed last. Surface the first close error if the walk itself succeeded.
+	defer func() {
+		if cerr := gz.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+	defer func() {
+		if cerr := tarball.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 
 	absPath, err := filepath.Abs(basedir)
 	if err != nil {
@@ -35,9 +51,13 @@ func ArchiveFS(ctx context.Context, basedir string, w io.Writer) error {
 		basedir = bdir
 	}
 
-	errChan := make(chan error, 1)
-	walkFn := func(path string, info os.FileInfo, err error) error {
+	return filepath.Walk(basedir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			return err
+		}
+
+		// stop processing if we get a cancellation signal
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 
@@ -53,62 +73,17 @@ func ArchiveFS(ctx context.Context, basedir string, w io.Writer) error {
 			return err
 		}
 
-		if !info.IsDir() {
-			src, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			defer src.Close()
-
-			_, err = io.Copy(tarball, src)
-			if err != nil {
-				return err
-			}
-
-			err = tarball.Flush()
-			if err != nil {
-				return err
-			}
-
-			err = gz.Flush()
-			if err != nil {
-				return err
-			}
+		if info.IsDir() {
+			return nil
 		}
 
-		return nil
-	}
-
-	// stop processing if we get a cancellation signal
-	err = filepath.Walk(basedir, func(path string, info os.FileInfo, err error) error {
-		go func() { errChan <- walkFn(path, info, err) }()
-
-		select {
-		case <-ctx.Done():
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-		case err := <-errChan:
-			if err != nil {
-				return err
-			}
+		src, err := os.Open(path)
+		if err != nil {
+			return err
 		}
+		defer src.Close()
 
-		return nil
+		_, err = io.Copy(tarball, src)
+		return err
 	})
-	if err != nil {
-		fmt.Println(err)
-		return err
-	}
-
-	err = gz.Close()
-	if err != nil {
-		return err
-	}
-	err = tarball.Close()
-	if err != nil {
-		return err
-	}
-
-	return nil
 }

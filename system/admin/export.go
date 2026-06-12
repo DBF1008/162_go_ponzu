@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ponzu-cms/ponzu/management/format"
+	"github.com/ponzu-cms/ponzu/system/backup"
 	"github.com/ponzu-cms/ponzu/system/db"
 	"github.com/ponzu-cms/ponzu/system/item"
 
@@ -126,12 +127,8 @@ func exportCSV(res http.ResponseWriter, req *http.Request, pt func() interface{}
 		log.Println("Failed to close tmp file for CSV export:", err)
 	}
 
-	ts := time.Now().Unix()
-	disposition := `attachment; filename="export-%s-%d.csv"`
-
-	res.Header().Set("Content-Type", "text/csv")
-	res.Header().Set("Content-Disposition", fmt.Sprintf(disposition, t, ts))
-	res.Header().Set("Content-Length", fmt.Sprintf("%d", int(fi.Size())))
+	filename := fmt.Sprintf("export-%s-%d.csv", t, time.Now().Unix())
+	backup.SetDownloadHeaders(res, filename, "text/csv", fi.Size())
 
 	http.ServeFile(res, req, tmpFile.Name())
 

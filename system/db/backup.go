@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/boltdb/bolt"
+	"github.com/ponzu-cms/ponzu/system/backup"
 )
 
 // Backup writes a snapshot of the system.db database to an HTTP response. The
@@ -16,12 +17,8 @@ func Backup(ctx context.Context, res http.ResponseWriter) error {
 
 	go func() {
 		errChan <- store.View(func(tx *bolt.Tx) error {
-			ts := time.Now().Unix()
-			disposition := `attachment; filename="system-%d.db.bak"`
-
-			res.Header().Set("Content-Type", "application/octet-stream")
-			res.Header().Set("Content-Disposition", fmt.Sprintf(disposition, ts))
-			res.Header().Set("Content-Length", fmt.Sprintf("%d", int(tx.Size())))
+			filename := fmt.Sprintf("system-%d.db.bak", time.Now().Unix())
+			backup.SetDownloadHeaders(res, filename, "application/octet-stream", tx.Size())
 
 			_, err := tx.WriteTo(res)
 			return err

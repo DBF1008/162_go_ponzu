@@ -9,6 +9,7 @@ import (
 
 	"github.com/ponzu-cms/ponzu/system/db"
 	"github.com/ponzu-cms/ponzu/system/item"
+	"github.com/ponzu-cms/ponzu/system/storage"
 )
 
 func deleteUploadFromDisk(target string) error {
@@ -24,8 +25,16 @@ func deleteUploadFromDisk(target string) error {
 		return err
 	}
 
-	// split and rebuild path in OS friendly way
-	// use path to delete the physical file from disk
+	store := storage.New()
+
+	// If the storage backend is S3-compatible, use it for deletion.
+	// S3 URLs start with http:// or https:// and are handled by S3Storage.Delete.
+	if store.IsObjectStorage() {
+		return store.Delete(upload.Path)
+	}
+
+	// Local storage: split and rebuild path in OS-friendly way, then
+	// delete the physical file from disk.
 	pathSplit := strings.Split(strings.TrimPrefix(upload.Path, "/api/"), "/")
 	pathJoin := filepath.Join(pathSplit...)
 	err = os.Remove(pathJoin)

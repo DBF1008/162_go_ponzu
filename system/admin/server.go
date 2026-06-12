@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/ponzu-cms/ponzu/system/cfg"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/ponzu-cms/ponzu/system/admin/user"
 	"github.com/ponzu-cms/ponzu/system/api"
 	"github.com/ponzu-cms/ponzu/system/db"
+	"github.com/ponzu-cms/ponzu/system/storage"
 )
 
 // Run adds Handlers to default http listener for Admin
@@ -55,8 +57,22 @@ func Run() {
 	// API path needs to be registered within server package so that it is handled
 	// even if the API server is not running. Otherwise, images/files uploaded
 	// through the editor will not load within the admin system.
-	uploadsDir := cfg.UploadDir()
-	http.Handle("/api/uploads/", api.Record(api.CORS(db.CacheControl(http.StripPrefix("/api/uploads/", http.FileServer(restrict(http.Dir(uploadsDir))))))))
+	//
+	// When S3 object storage is configured, requests to /api/uploads/ are
+	// redirected (302) to the S3 object URL. Otherwise files are served from
+	// the local upload directory as before.
+	s3cfg := storage.ConfigFromEnv()
+	if s3cfg.IsConfigured() {
+		s3 := storage.NewS3Storage(s3cfg)
+		http.HandleFunc("/api/uploads/", func(res http.ResponseWriter, req *http.Request) {
+			key := strings.TrimPrefix(req.URL.Path, "/api/uploads/")
+			redirectURL := fmt.Sprintf("https://%s/%s", s3.Host(), key)
+			http.Redirect(res, req, redirectURL, http.StatusFound)
+		})
+	} else {
+		uploadsDir := cfg.UploadDir()
+		http.Handle("/api/uploads/", api.Record(api.CORS(db.CacheControl(http.StripPrefix("/api/uploads/", http.FileServer(restrict(http.Dir(uploadsDir))))))))
+	}
 
 	// Database & uploads backup via HTTP route registered with Basic Auth middleware.
 	http.HandleFunc("/admin/backup", system.BasicAuth(backupHandler))

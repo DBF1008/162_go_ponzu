@@ -4,20 +4,15 @@ package upload
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
-	"strconv"
 	"time"
-
-	"github.com/ponzu-cms/ponzu/system/cfg"
 
 	"github.com/ponzu-cms/ponzu/system/db"
 	"github.com/ponzu-cms/ponzu/system/item"
+	"github.com/ponzu-cms/ponzu/system/storage"
 )
 
 // StoreFiles stores file uploads at paths like /YYYY/MM/filename.ext
@@ -42,23 +37,9 @@ func StoreFiles(req *http.Request) (map[string]string, error) {
 
 	req.Form.Set("timestamp", ts)
 
-	// get or create upload directory to save files from request
-	i, err := strconv.ParseInt(ts, 10, 64)
-	if err != nil {
-		return nil, err
-	}
+	store := storage.New()
 
-	tm := time.Unix(int64(i/1000), int64(i%1000))
-
-	urlPathPrefix := "api"
-	uploadDirName := "uploads"
-	uploadDir := filepath.Join(cfg.UploadDir(), fmt.Sprintf("%d", tm.Year()), fmt.Sprintf("%02d", tm.Month()))
-	err = os.MkdirAll(uploadDir, os.ModeDir|os.ModePerm)
-	if err != nil {
-		return nil, err
-	}
-
-	// loop over all files and save them to disk
+	// loop over all files and save to the configured storage backend
 	for name, fds := range req.MultipartForm.File {
 		filename, err := item.NormalizeString(fds[0].Filename)
 		if err != nil {
@@ -73,45 +54,32 @@ func StoreFiles(req *http.Request) (map[string]string, error) {
 		}
 		defer src.Close()
 
-		// check if file at path exists, if so, add timestamp to file
-		absPath := filepath.Join(uploadDir, filename)
+		contentType := fds[0].Header.Get("Content-Type")
 
-		if _, err := os.Stat(absPath); !os.IsNotExist(err) {
-			filename = fmt.Sprintf("%d-%s", time.Now().Unix(), filename)
-			absPath = filepath.Join(uploadDir, filename)
-		}
-
-		// save to disk (TODO: or check if S3 credentials exist, & save to cloud)
-		dst, err := os.Create(absPath)
+		// Store file via the configured backend (local disk or S3).
+		// Local returns "/api/uploads/YYYY/MM/filename.ext";
+		// S3 returns a full URL like "https://bucket.s3.region.amazonaws.com/...".
+		urlPath, err := store.Store(src, filename, contentType)
 		if err != nil {
-			err := fmt.Errorf("Failed to create destination file for upload: %s", err)
+			err := fmt.Errorf("Failed to store uploaded file: %s", err)
 			return nil, err
 		}
 
-		// copy file from src to dst on disk
-		var size int64
-		if size, err = io.Copy(dst, src); err != nil {
-			err := fmt.Errorf("Failed to copy uploaded file to destination: %s", err)
-			return nil, err
-		}
-
-		// add name:urlPath to req.PostForm to be inserted into db
-		urlPath := fmt.Sprintf("/%s/%s/%d/%02d/%s", urlPathPrefix, uploadDirName, tm.Year(), tm.Month(), filename)
 		urlPaths[name] = urlPath
 
 		// add upload information to db
-		go storeFileInfo(size, filename, urlPath, fds)
+		go storeFileInfo(urlPath, filename, contentType, fds)
 	}
 
 	return urlPaths, nil
 }
 
-func storeFileInfo(size int64, filename, urlPath string, fds []*multipart.FileHeader) {
+func storeFileInfo(urlPath, filename, contentType string, fds []*multipart.FileHeader) {
 	data := url.Values{
 		"name":           []string{filename},
 		"path":           []string{urlPath},
-		"content_type":   []string{fds[0].Header.Get("Content-Type")},
-		"content_length": []string{fmt.Sprintf("%d", size)},
+		"content_type":   []string{contentType},
+		"content_length": []string{fmt.Sprintf("%d", fds[0].Size)},
 	}
 
 	_, err := db.SetUpload("__uploads:-1", data)

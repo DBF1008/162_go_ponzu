@@ -707,6 +707,63 @@ func (s sortableContent) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 
+// NormalizeMultiValueFields rewrites dotted form keys produced by multi-value
+// editor fields (e.g. tags.0, tags.1) into the flat multi-value format that
+// gorilla/schema expects for []string struct fields (e.g. tags=A, tags=B).
+//
+// It handles:
+//   - Multiple independent multi-value fields without cross-contamination
+//   - Non-contiguous indices (e.g. after deleting a middle item)
+//   - Correct numeric ordering regardless of map iteration order
+func NormalizeMultiValueFields(data url.Values) {
+	fieldOrderValue := make(map[string]map[string][]string)
+
+	// Collect all dotted keys (field.N format) and remove them from data
+	for k, v := range data {
+		lastDot := strings.LastIndex(k, ".")
+		if lastDot < 0 {
+			continue
+		}
+
+		field := k[:lastDot]
+		order := k[lastDot+1:]
+
+		// Only treat as multi-value if the suffix is a non-negative integer
+		if _, err := strconv.Atoi(order); err != nil {
+			continue
+		}
+
+		if fieldOrderValue[field] == nil {
+			fieldOrderValue[field] = make(map[string][]string)
+		}
+		fieldOrderValue[field][order] = v
+		data.Del(k)
+	}
+
+	// Write back values sorted by numeric index so gorilla/schema decodes
+	// them into the correct slice positions
+	for f, ov := range fieldOrderValue {
+		orders := make([]int, 0, len(ov))
+		for k := range ov {
+			n, _ := strconv.Atoi(k)
+			orders = append(orders, n)
+		}
+		sort.Ints(orders)
+
+		first := true
+		for _, o := range orders {
+			for _, fv := range ov[strconv.Itoa(o)] {
+				if first {
+					data.Set(f, fv)
+					first = false
+				} else {
+					data.Add(f, fv)
+				}
+			}
+		}
+	}
+}
+
 func postToJSON(ns string, data url.Values) ([]byte, error) {
 	// find the content type and decode values into it
 	t, ok := item.Types[ns]
@@ -718,49 +775,7 @@ func postToJSON(ns string, data url.Values) ([]byte, error) {
 	// check for any multi-value fields (ex. checkbox fields)
 	// and correctly format for db storage. Essentially, we need
 	// fieldX.0: value1, fieldX.1: value2 => fieldX: []string{value1, value2}
-	fieldOrderValue := make(map[string]map[string][]string)
-	for k, v := range data {
-		if strings.Contains(k, ".") {
-			fo := strings.Split(k, ".")
-
-			// put the order and the field value into map
-			field := string(fo[0])
-			order := string(fo[1])
-			if len(fieldOrderValue[field]) == 0 {
-				fieldOrderValue[field] = make(map[string][]string)
-			}
-
-			// orderValue is 0:[?type=Thing&id=1]
-			orderValue := fieldOrderValue[field]
-			orderValue[order] = v
-			fieldOrderValue[field] = orderValue
-
-			// discard the post form value with name.N
-			data.Del(k)
-		}
-	}
-
-	// add/set the key & value to the post form in order
-	for f, ov := range fieldOrderValue {
-		for i := 0; i < len(ov); i++ {
-			position := fmt.Sprintf("%d", i)
-			fieldValue := ov[position]
-
-			if data.Get(f) == "" {
-				for i, fv := range fieldValue {
-					if i == 0 {
-						data.Set(f, fv)
-					} else {
-						data.Add(f, fv)
-					}
-				}
-			} else {
-				for _, fv := range fieldValue {
-					data.Add(f, fv)
-				}
-			}
-		}
-	}
+	NormalizeMultiValueFields(data)
 
 	dec := schema.NewDecoder()
 	dec.SetAliasTag("json")     // allows simpler struct tagging when creating a content type

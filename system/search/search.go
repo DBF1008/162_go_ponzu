@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/ponzu-cms/ponzu/system/cfg"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/blevesearch/bleve"
 	"github.com/blevesearch/bleve/mapping"
+	"github.com/blevesearch/bleve/search"
 )
 
 var (
@@ -153,6 +155,82 @@ func TypeQuery(typeName, query string, count, offset int) ([]string, error) {
 
 	var results []string
 	for _, hit := range res.Hits {
+		results = append(results, hit.ID)
+	}
+
+	return results, nil
+}
+
+// MultiTypeQuery conducts a search across multiple content type indices and
+// returns a single, relevance-sorted set of Ponzu "targets" (Type:ID pairs).
+// The results from all requested types are merged and ordered by descending
+// bleve score before count/offset pagination is applied, so the caller sees a
+// unified, relevance-ranked result set regardless of which type a match came
+// from.
+//
+// If any requested type has no search index, ErrNoIndex is returned. If any
+// individual search fails, that type's results are skipped and the error is
+// logged but other types are still returned.
+func MultiTypeQuery(typeNames []string, query string, count, offset int) ([]string, error) {
+	if len(typeNames) == 0 {
+		return nil, nil
+	}
+
+	// If only one type is requested, delegate to the single-type path so
+	// behavior (including error semantics) is identical to TypeQuery.
+	if len(typeNames) == 1 {
+		return TypeQuery(typeNames[0], query, count, offset)
+	}
+
+	var allHits search.DocumentMatchCollection
+	for _, typeName := range typeNames {
+		idx, ok := Search[typeName]
+		if !ok {
+			return nil, ErrNoIndex
+		}
+
+		q := bleve.NewQueryStringQuery(query)
+		// Fetch enough hits from each index so that, after merging and
+		// sorting by score, the final paginated window is correct. In the
+		// worst case every result in the requested page comes from a
+		// single type, so we need at least offset+count hits per index.
+		limit := count
+		if limit < 0 {
+			// count == -1 means "all matches"; use a large upper bound
+			// and let bleve cap it at the actual match count.
+			limit = 10000
+		}
+		if offset > 0 {
+			limit += offset
+		}
+
+		req := bleve.NewSearchRequestOptions(q, limit, 0, false)
+		res, err := idx.Search(req)
+		if err != nil {
+			return nil, err
+		}
+
+		allHits = append(allHits, res.Hits...)
+	}
+
+	// Merge and sort by descending relevance score.
+	sort.Slice(allHits, func(i, j int) bool {
+		return allHits[i].Score > allHits[j].Score
+	})
+
+	// Apply count/offset to the merged result set. If count is -1, return
+	// everything from offset onward (matches TypeQuery semantics).
+	start := offset
+	if start > len(allHits) {
+		start = len(allHits)
+	}
+	end := len(allHits)
+	if count >= 0 && start+count < end {
+		end = start + count
+	}
+
+	var results []string
+	for _, hit := range allHits[start:end] {
 		results = append(results, hit.ID)
 	}
 
